@@ -1,26 +1,25 @@
 import re
+import os
 import logging
+from typing import List, Dict, Any, Optional
 from alpaca_trade_api import REST
-from alpaca_trade_api.common import URL
 
 # Logging-Konfiguration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Alpaca API Konfiguration
-API_KEY = 'PKKGZTEBC6UNSGUFD1Z7'  # Ersetze mit deinem API-Schlüssel
-API_SECRET = 'IFdjAyvhX2RlpUgMwkIqAoedUrEsUqdID2u5hbOh'  # Ersetze mit deinem Secret-Schlüssel
-BASE_URL = 'https://paper-api.alpaca.markets'
+# Alpaca API Konfiguration aus Umgebung
+ALPACA_API_KEY = os.getenv('ALPACA_API_KEY')
+ALPACA_API_SECRET = os.getenv('ALPACA_API_SECRET')
+ALPACA_BASE_URL = os.getenv('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets')
 
-# API-Verbindung
-try:
-    api = REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
-    logger.info("Verbindung zur Alpaca API erfolgreich hergestellt.")
-except Exception as e:
-    logger.error(f"Fehler bei der Alpaca API-Verbindung: {e}")
-    exit(1)
+def get_alpaca_client() -> REST:
+    """Erstellt und gibt einen Alpaca REST-Client zurück."""
+    if not ALPACA_API_KEY or not ALPACA_API_SECRET:
+        raise RuntimeError('ALPACA_API_KEY/ALPACA_API_SECRET sind nicht gesetzt')
+    return REST(ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_BASE_URL, api_version='v2')
 
-def parse_signals(response):
+def parse_signals(response: str) -> List[Dict[str, Any]]:
     """Extrahiert Signale aus der KI-Antwort."""
     try:
         signals_block = re.search(r'\[SIGNAL\](.*?)\[/SIGNAL\]', response, re.DOTALL)
@@ -32,6 +31,8 @@ def parse_signals(response):
         parsed_signals = []
 
         for signal in signals:
+            if not signal.strip():
+                continue
             parts = signal.split(': ')
             if len(parts) < 2:
                 logger.warning(f"Ungültiges Signalformat: {signal}")
@@ -55,13 +56,17 @@ def parse_signals(response):
         logger.error(f"Fehler beim Parsen der Signale: {e}")
         return []
 
-def submit_order(signal):
+def submit_order(signal: Dict[str, Any], api: Optional[REST] = None) -> None:
     """Sendet ein Signal an die Alpaca API."""
     try:
+        if api is None:
+            api = get_alpaca_client()
         crypto = signal['crypto']
         action = signal['action']
         symbol = f"{crypto}USD"
-        qty = 1  # Anpassbar
+        # Menge aus Signal oder Standard 1
+        qty_raw = signal.get('menge') or signal.get('qty') or 1
+        qty = float(qty_raw)
 
         if action == 'KAUF':
             api.submit_order(symbol=symbol, qty=qty, side='buy', type='market', time_in_force='gtc')
@@ -96,31 +101,42 @@ def submit_order(signal):
 
         # Zusätzliche Stop-Loss-Order, falls angegeben
         if 'stop_loss' in signal:
-            stop_price = float(signal.get('preis', api.get_latest_trade(symbol).price)) * (1 + float(signal['stop_loss']) / 100)
-            api.submit_order(symbol=symbol, qty=qty, side='sell', type='stop', stop_price=stop_price, time_in_force='gtc')
-            logger.info(f"Stop-Loss für {symbol} bei {stop_price} gesetzt.")
+            base_price = signal.get('preis')
+            latest_price = None
+            if base_price is not None:
+                try:
+                    latest_price = float(base_price)
+                except Exception:
+                    latest_price = None
+            if latest_price is None:
+                try:
+                    trade = api.get_latest_trade(symbol)
+                    latest_price = float(getattr(trade, 'price', 0))
+                except Exception:
+                    latest_price = None
+            if latest_price and latest_price > 0:
+                stop_price = latest_price * (1 + float(signal['stop_loss']) / 100)
+                api.submit_order(symbol=symbol, qty=qty, side='sell', type='stop', stop_price=stop_price, time_in_force='gtc')
+                logger.info(f"Stop-Loss für {symbol} bei {stop_price} gesetzt.")
+            else:
+                logger.warning(f"Kein gültiger Preis für Stop-Loss bei {symbol} verfügbar.")
 
     except Exception as e:
-        logger.error(f"Fehler beim Senden des Auftrags für {signal['crypto']}: {e}")
+        logger.error(f"Fehler beim Senden des Auftrags für {signal.get('crypto', 'UNBEKANNT')}: {e}")
 
-def main():
-    # Beispielantwort der KI
-    response = """
-    Bericht...
-    [SIGNAL]
-    BTC: LIMIT_KAUF, Preis=44.500, Take_Profit=+10%, Trailing_Stop=5%, Konfidenz=92%
-    ETH: HALTEN, Konfidenz=90%
-    XRP: TAKE_PROFIT, Preis=0.98, Konfidenz=91%
-    [/SIGNAL]
-    """
-
+def run_demo_from_text(response: str) -> None:
+    """Parst eine Textantwort und sendet resultierende Orders (nur zu Testzwecken)."""
     signals = parse_signals(response)
     if not signals:
         logger.warning("Keine gültigen Signale gefunden.")
         return
-
+    api = get_alpaca_client()
     for signal in signals:
-        submit_order(signal)
+        submit_order(signal, api=api)
 
-if __name__ == "__main__":
-    main()
+__all__ = [
+    'get_alpaca_client',
+    'parse_signals',
+    'submit_order',
+    'run_demo_from_text',
+]
