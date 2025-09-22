@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trading Dashboard – Live Signale</title>
+    <link rel="stylesheet" href="https://unpkg.com/modern-normalize/modern-normalize.css" />
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica Neue, Arial, "Apple Color Emoji", "Segoe UI Emoji"; padding: 20px; }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+      h1 { font-size: 1.2rem; margin: 0; }
+      button { padding: 8px 12px; border: 1px solid #222; background: #fff; cursor: pointer; border-radius: 6px; }
+      button.primary { background: #222; color: #fff; }
+      table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+      th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e5e7eb; font-size: 0.92rem; }
+      tr:hover { background: #f9fafb; }
+      .chip { font-size: 0.78rem; padding: 2px 6px; border-radius: 999px; }
+      .buy { background: #dcfce7; color: #14532d; }
+      .sell { background: #fee2e2; color: #7f1d1d; }
+      .hold { background: #e5e7eb; color: #111827; }
+      footer { margin-top: 24px; color: #6b7280; font-size: 0.85rem; }
+      .small { color: #6b7280; font-size: 0.8rem; }
+      .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+      code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Trading Dashboard – Live Signale</h1>
+      <div class="row">
+        <button id="btn-push" class="primary">Benachrichtigungen aktivieren</button>
+      </div>
+    </header>
+
+    <div class="small">Verbunden mit Live-Stream: <span id="conn">…</span></div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Zeit</th>
+          <th>Symbol</th>
+          <th>Aktion</th>
+          <th>Preis</th>
+          <th>Menge</th>
+          <th>Anteil</th>
+          <th>TP</th>
+          <th>SL</th>
+          <th>Konf.</th>
+          <th>Strategien</th>
+        </tr>
+      </thead>
+      <tbody id="signals"></tbody>
+    </table>
+
+    <footer>
+      Läuft minütlich. Web Push optional – erfordert Browser-Permission.
+    </footer>
+
+    <script src="/static/main.js"></script>
+  </body>
+  </html>
+

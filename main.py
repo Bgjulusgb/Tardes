@@ -1,126 +1,175 @@
-import re
+import asyncio
+import json
 import logging
-from alpaca_trade_api import REST
-from alpaca_trade_api.common import URL
+import os
+from datetime import datetime, timezone
+from typing import AsyncGenerator, Dict, List
 
-# Logging-Konfiguration
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from app.engine.engine import get_config, run_analysis
+from app.broker.alpaca import submit_order as broker_submit
+from app.notify.push import SubscriptionStore, ensure_vapid_keys, send_push_to_all
+
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Alpaca API Konfiguration
-API_KEY = 'PKKGZTEBC6UNSGUFD1Z7'  # Ersetze mit deinem API-Schlüssel
-API_SECRET = 'IFdjAyvhX2RlpUgMwkIqAoedUrEsUqdID2u5hbOh'  # Ersetze mit deinem Secret-Schlüssel
-BASE_URL = 'https://paper-api.alpaca.markets'
 
-# API-Verbindung
-try:
-    api = REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
-    logger.info("Verbindung zur Alpaca API erfolgreich hergestellt.")
-except Exception as e:
-    logger.error(f"Fehler bei der Alpaca API-Verbindung: {e}")
-    exit(1)
+app = FastAPI(title="Trading Signals Server")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def parse_signals(response):
-    """Extrahiert Signale aus der KI-Antwort."""
+static_dir = os.path.join(os.getcwd(), "static")
+if os.path.isdir(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+
+subscriptions = SubscriptionStore(file_path=os.path.join(os.getcwd(), "subscriptions.json"))
+vapid = ensure_vapid_keys()
+
+
+class Broadcaster:
+    def __init__(self) -> None:
+        self.clients: List[asyncio.Queue] = []
+
+    async def stream(self) -> AsyncGenerator[bytes, None]:
+        queue: asyncio.Queue = asyncio.Queue()
+        self.clients.append(queue)
+        try:
+            while True:
+                data = await queue.get()
+                yield f"data: {json.dumps(data)}\n\n".encode("utf-8")
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                self.clients.remove(queue)
+            except ValueError:
+                pass
+
+    async def publish(self, data: Dict) -> None:
+        stale: List[asyncio.Queue] = []
+        for q in list(self.clients):
+            try:
+                q.put_nowait(data)
+            except Exception:
+                stale.append(q)
+        for q in stale:
+            try:
+                self.clients.remove(q)
+            except ValueError:
+                pass
+
+
+broadcaster = Broadcaster()
+
+
+@app.get("/")
+async def root() -> HTMLResponse:
     try:
-        signals_block = re.search(r'\[SIGNAL\](.*?)\[/SIGNAL\]', response, re.DOTALL)
-        if not signals_block:
-            logger.error("Kein [SIGNAL]-Block gefunden.")
-            return []
+        html = open(os.path.join(static_dir, "index.html"), "r", encoding="utf-8").read()
+        return HTMLResponse(html)
+    except Exception:
+        return HTMLResponse("<h1>Trading Signals</h1>")
 
-        signals = signals_block.group(1).strip().split('\n')
-        parsed_signals = []
 
-        for signal in signals:
-            parts = signal.split(': ')
-            if len(parts) < 2:
-                logger.warning(f"Ungültiges Signalformat: {signal}")
-                continue
+@app.get("/sw.js")
+async def service_worker() -> FileResponse:
+    path = os.path.join(static_dir, "sw.js")
+    return FileResponse(path, media_type="application/javascript")
 
-            crypto = parts[0]
-            action_data = parts[1].split(', ')
-            action = action_data[0]
 
-            # Extrahiere Parameter
-            params = {'crypto': crypto, 'action': action}
-            for item in action_data[1:]:
-                if '=' in item:
-                    key, value = item.split('=')
-                    key = key.lower().replace(' ', '_')
-                    params[key] = value.replace('%', '')
+@app.get("/events")
+async def events() -> StreamingResponse:
+    async def generator():
+        # Initial heartbeat to establish connection
+        yield f"data: {json.dumps({'type': 'heartbeat', 'ts': datetime.now(timezone.utc).isoformat()})}\n\n".encode("utf-8")
+        async for chunk in broadcaster.stream():
+            yield chunk
 
-            parsed_signals.append(params)
-        return parsed_signals
-    except Exception as e:
-        logger.error(f"Fehler beim Parsen der Signale: {e}")
-        return []
+    return StreamingResponse(generator(), media_type="text/event-stream")
 
-def submit_order(signal):
-    """Sendet ein Signal an die Alpaca API."""
+
+@app.get("/config")
+async def get_server_config() -> JSONResponse:
+    cfg = get_config()
+    return JSONResponse({
+        "symbols": cfg["symbols"],
+        "period": cfg["period"],
+        "interval": cfg["interval"],
+        "auto_trade": cfg["auto_trade"],
+    })
+
+
+@app.get("/vapid")
+async def get_vapid() -> JSONResponse:
+    pub = vapid.get("public") if vapid else None
+    return JSONResponse({"publicKey": pub})
+
+
+@app.post("/subscribe")
+async def subscribe(req: Request) -> JSONResponse:
+    body = await req.json()
+    subscriptions.add(body)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/analyze")
+async def analyze() -> JSONResponse:
+    cfg = get_config()
+    signals = run_analysis(cfg["symbols"], cfg["equity"], cfg["risk_pct"], cfg["period"], cfg["interval"], cfg["timeframe"])
+    await broadcaster.publish({"type": "signals", "data": signals})
+    return JSONResponse({"signals": signals})
+
+
+async def run_cycle() -> None:
+    cfg = get_config()
     try:
-        crypto = signal['crypto']
-        action = signal['action']
-        symbol = f"{crypto}USD"
-        qty = 1  # Anpassbar
+        signals = run_analysis(cfg["symbols"], cfg["equity"], cfg["risk_pct"], cfg["period"], cfg["interval"], cfg["timeframe"])
+        await broadcaster.publish({"type": "signals", "data": signals})
+        # Optional: auto trade + push
+        notified = 0
+        traded = 0
+        for sig in signals:
+            if cfg["auto_trade"]:
+                if broker_submit(sig):
+                    traded += 1
+            payload = {
+                "title": f"Signal {sig['action']} {sig['symbol']}",
+                "body": f"Preis {sig['entry_price']} • Menge {sig['quantity']} • {sig['confidence']}%",
+                "symbol": sig["symbol"],
+                "action": sig["action"],
+                "quantity": sig["quantity"],
+                "position_percent": sig["position_percent"],
+                "entry_price": sig["entry_price"],
+                "take_profit_price": sig.get("take_profit_price"),
+                "stop_loss_price": sig.get("stop_loss_price"),
+            }
+            notified += send_push_to_all(subscriptions, payload, vapid)
+        logger.info(f"Zyklus: {len(signals)} Signale, {traded} Trades, {notified} Push gesendet")
+    except Exception as exc:
+        logger.exception(f"Fehler im Zyklus: {exc}")
 
-        if action == 'KAUF':
-            api.submit_order(symbol=symbol, qty=qty, side='buy', type='market', time_in_force='gtc')
-            logger.info(f"Marktkauf für {symbol} ausgeführt.")
 
-        elif action == 'LIMIT_KAUF':
-            limit_price = float(signal.get('preis'))
-            api.submit_order(symbol=symbol, qty=qty, side='buy', type='limit', limit_price=limit_price, time_in_force='gtc')
-            logger.info(f"Limit-Kauf für {symbol} bei {limit_price} platziert.")
+@app.on_event("startup")
+async def on_startup() -> None:
+    async def scheduler() -> None:
+        await asyncio.sleep(0.1)
+        while True:
+            await run_cycle()
+            await asyncio.sleep(60)
+    asyncio.create_task(scheduler())
 
-        elif action == 'VERKAUF':
-            api.submit_order(symbol=symbol, qty=qty, side='sell', type='market', time_in_force='gtc')
-            logger.info(f"Marktverkauf für {symbol} ausgeführt.")
-
-        elif action == 'LIMIT_VERKAUF':
-            limit_price = float(signal.get('preis'))
-            api.submit_order(symbol=symbol, qty=qty, side='sell', type='limit', limit_price=limit_price, time_in_force='gtc')
-            logger.info(f"Limit-Verkauf für {symbol} bei {limit_price} platziert.")
-
-        elif action == 'TAKE_PROFIT':
-            take_profit_price = float(signal.get('preis'))
-            api.submit_order(symbol=symbol, qty=qty, side='sell', type='limit', limit_price=take_profit_price, time_in_force='gtc')
-            logger.info(f"Take-Profit für {symbol} bei {take_profit_price} platziert.")
-
-        elif action == 'TRAILING_STOP':
-            trail_percent = float(signal.get('trailing_stop')) / 100
-            api.submit_order(symbol=symbol, qty=qty, side='sell', type='trailing_stop', trail_percent=trail_percent, time_in_force='gtc')
-            logger.info(f"Trailing Stop für {symbol} mit {trail_percent*100}% gesetzt.")
-
-        elif action == 'HALTEN':
-            logger.info(f"{symbol}: Keine Aktion erforderlich.")
-
-        # Zusätzliche Stop-Loss-Order, falls angegeben
-        if 'stop_loss' in signal:
-            stop_price = float(signal.get('preis', api.get_latest_trade(symbol).price)) * (1 + float(signal['stop_loss']) / 100)
-            api.submit_order(symbol=symbol, qty=qty, side='sell', type='stop', stop_price=stop_price, time_in_force='gtc')
-            logger.info(f"Stop-Loss für {symbol} bei {stop_price} gesetzt.")
-
-    except Exception as e:
-        logger.error(f"Fehler beim Senden des Auftrags für {signal['crypto']}: {e}")
-
-def main():
-    # Beispielantwort der KI
-    response = """
-    Bericht...
-    [SIGNAL]
-    BTC: LIMIT_KAUF, Preis=44.500, Take_Profit=+10%, Trailing_Stop=5%, Konfidenz=92%
-    ETH: HALTEN, Konfidenz=90%
-    XRP: TAKE_PROFIT, Preis=0.98, Konfidenz=91%
-    [/SIGNAL]
-    """
-
-    signals = parse_signals(response)
-    if not signals:
-        logger.warning("Keine gültigen Signale gefunden.")
-        return
-
-    for signal in signals:
-        submit_order(signal)
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
